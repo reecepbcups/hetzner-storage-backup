@@ -8,7 +8,7 @@ It requires just some configuration, the storage box account information, and a 
 ```sh
 git clone https://github.com/Reecepbcups/hetzner-storage-backup.git
 # git clone git@github.com:Reecepbcups/hetzner-storage-backup.git
-cd hetzner-storage-backup/go
+cd hetzner-storage-backup
 
 # install Go if you don't have it: https://go.dev/doc/install
 
@@ -30,7 +30,7 @@ cp secret.json.example secret.json
 
 # BE SURE TO RUN THIS FROM THE ROOT OF WHAT YOU SET 'save-location' IN THE CONFIG
 # EDITOR=nano crontab -e
-0 2 * * * /root/hetzner-storage-backup/go/hetzner-backup /root/hetzner-storage-backup/go/secret.json
+0 2 * * * /root/hetzner-storage-backup/hetzner-backup /root/hetzner-storage-backup/secret.json
 
 # Times are in UTC (6am UTC = 12am CST)
 # Run every night at 2am:            0 2 * * *

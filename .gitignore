@@ -1,7 +1,5 @@
 secret.json
-*/__pycache__/*
-venv/
 secretbackup.json
 .idea
 # Go build output
-go/hetzner-backup
+hetzner-backup
