@@ -1,6 +1,0 @@
-pyfiglet
-pick
-pymongo
-pysftp
-cffi # required for pysftp
-discord-webhook
