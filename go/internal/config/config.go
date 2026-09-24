@@ -34,6 +34,7 @@ type Backups struct {
 	SaveLocation    string                `json:"save-location"`
 	MaxLocalBackups int                   `json:"max-local-backups"`
 	SaveRelative    bool                  `json:"save-relative"`
+	MaxParallel     int                   `json:"max-parallel"`
 	ParentPaths     map[string]ParentPath `json:"parent-paths"`
 	HetznerSFTP     HetznerSFTP           `json:"hetzner-sftp"`
 	Database        Database              `json:"database"`

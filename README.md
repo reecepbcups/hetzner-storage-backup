@@ -8,11 +8,14 @@ It requires just some configuration, the storage box account information, and a 
 ```sh
 git clone https://github.com/Reecepbcups/hetzner-storage-backup.git
 # git clone git@github.com:Reecepbcups/hetzner-storage-backup.git
-cd hetzner-storage-backup
+cd hetzner-storage-backup/go
 
-# install required dependencies
-# sudo apt-get -y install python3-pip
-python3 -m pip install -r requirements.txt
+# install Go if you don't have it: https://go.dev/doc/install
+
+# builds ./hetzner-backup
+just install
+# or without just:
+# go mod tidy && go build -o hetzner-backup .
 
 # Change your hostname if you want different notification names
 hostnamectl set-hostname new-hostname
@@ -27,7 +30,7 @@ cp secret.json.example secret.json
 
 # BE SURE TO RUN THIS FROM THE ROOT OF WHAT YOU SET 'save-location' IN THE CONFIG
 # EDITOR=nano crontab -e
-0 2 * * * /usr/bin/python3 /root/hetzner-storage-backup/src/main.py
+0 2 * * * /root/hetzner-storage-backup/go/hetzner-backup /root/hetzner-storage-backup/go/secret.json
 
 # Times are in UTC (6am UTC = 12am CST)
 # Run every night at 2am:            0 2 * * *

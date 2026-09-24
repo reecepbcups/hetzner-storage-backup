@@ -3,3 +3,5 @@ secret.json
 venv/
 secretbackup.json
 .idea
+# Go build output
+go/hetzner-backup

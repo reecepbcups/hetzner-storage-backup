@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/pkg/sftp"
@@ -40,6 +41,7 @@ type Backup struct {
 	maxLocalBackups int
 	discordWebhook  string
 	saveRelative    bool
+	maxParallel     int
 
 	zipFilename        string
 	backupFileName     string
@@ -64,9 +66,13 @@ func New(cfg *config.Config, debug, showIgnored, showSuccess bool) (*Backup, err
 		maxLocalBackups: cfg.Backups.MaxLocalBackups,
 		discordWebhook:  cfg.DiscordWebhook,
 		saveRelative:    cfg.Backups.SaveRelative,
+		maxParallel:     cfg.Backups.MaxParallel,
 	}
 	if b.maxLocalBackups <= 0 {
 		b.maxLocalBackups = 0
+	}
+	if b.maxParallel <= 0 {
+		b.maxParallel = 1
 	}
 	if b.rootPaths == nil {
 		b.rootPaths = map[string]config.ParentPath{}
@@ -159,17 +165,10 @@ func (b *Backup) DeleteOldestFilesInDirIfOverMax() error {
 	return nil
 }
 
-// ZipFiles mirrors Backup.zip_files.
+// ZipFiles mirrors Backup.zip_files. Each parent path is zipped into its own
+// temp archive by up to max-parallel workers, then the parts are copied
+// (without recompressing) into the final zip.
 func (b *Backup) ZipFiles() error {
-	zipFile, err := os.Create(b.backupFileName)
-	if err != nil {
-		return err
-	}
-	defer zipFile.Close()
-
-	zw := zip.NewWriter(zipFile)
-	defer zw.Close()
-
 	mongoCfg := b.cfg.Backups.Database.MongoDB
 	if mongoCfg.Enabled {
 		if err := b.backupMongoDB(mongoCfg); err != nil {
@@ -177,93 +176,48 @@ func (b *Backup) ZipFiles() error {
 		}
 	}
 
-	for nickname, pathCfg := range b.rootPaths {
-		rootPath := pathCfg.Path
-		ignoreRegex := pathCfg.Ignore
+	nicknames := make([]string, 0, len(b.rootPaths))
+	for nickname := range b.rootPaths {
+		nicknames = append(nicknames, nickname)
+	}
+	sort.Strings(nicknames)
 
-		info, err := os.Stat(rootPath)
-		if err != nil || !info.IsDir() {
-			cosmetics.CPrint(fmt.Sprintf("\n&c%s is not a directory, ignoring...", rootPath))
-			continue
-		}
+	tmpDir, err := os.MkdirTemp("", "hetzner-backup-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tmpDir)
 
-		compiled := make([]*regexp.Regexp, 0, len(ignoreRegex))
-		for _, pattern := range ignoreRegex {
-			re, err := regexp.Compile(pattern)
+	parts := make([]string, len(nicknames))
+	errs := make([]error, len(nicknames))
+	sem := make(chan struct{}, b.maxParallel)
+	var wg sync.WaitGroup
+	for i, nickname := range nicknames {
+		wg.Add(1)
+		go func(i int, nickname string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			partPath := filepath.Join(tmpDir, nickname+".zip")
+			ok, err := b.zipRootPath(nickname, b.rootPaths[nickname], partPath)
 			if err != nil {
-				cosmetics.CPrint(fmt.Sprintf("&cInvalid ignore regex %q for %s: %v", pattern, nickname, err))
-				continue
+				errs[i] = fmt.Errorf("zipping %s: %w", nickname, err)
+				return
 			}
-			compiled = append(compiled, re)
-		}
-
-		textOutput := ""
-		newlineCount := 0
-
-		err = filepath.Walk(rootPath, func(absPath string, fi os.FileInfo, err error) error {
-			if err != nil {
-				return err
+			if ok {
+				parts[i] = partPath
 			}
-			if fi.IsDir() {
-				return nil
-			}
-
-			var relativeFilename string
-			if rootPath == b.mongodbAbsLocation {
-				rel := strings.TrimPrefix(strings.TrimPrefix(absPath, b.mongodbAbsLocation), string(os.PathSeparator))
-				relativeFilename = filepath.Join("mongodb", rel)
-			} else {
-				rel := strings.TrimPrefix(strings.TrimPrefix(absPath, rootPath), string(os.PathSeparator))
-				relativeFilename = filepath.Join(nickname, rel)
-			}
-
-			ignored := false
-			for _, re := range compiled {
-				if re.MatchString(absPath) {
-					ignored = true
-					break
-				}
-			}
-
-			if !ignored {
-				var arcname string
-				if b.saveRelative {
-					arcname = relativeFilename
-				} else {
-					arcname = absPath
-				}
-				if err := addFileToZip(zw, absPath, arcname); err != nil {
-					return err
-				}
-				if b.debug && b.showSuccess {
-					textOutput += fmt.Sprintf("&a%s\n", relativeFilename)
-					newlineCount++
-				}
-			} else {
-				if b.debug && b.showIgnored && !strings.Contains(absPath, "node_modules") {
-					textOutput += fmt.Sprintf("&c%s ignored\n", relativeFilename)
-					newlineCount++
-				}
-			}
-
-			if b.debug && newlineCount > 0 && newlineCount%25 == 0 {
-				cosmetics.CPrint(textOutput)
-				textOutput = ""
-			}
-			return nil
-		})
+		}(i, nickname)
+	}
+	wg.Wait()
+	for _, err := range errs {
 		if err != nil {
 			return err
 		}
-		if b.debug && textOutput != "" {
-			cosmetics.CPrint(textOutput)
-		}
 	}
 
-	if err := zw.Close(); err != nil {
-		return err
-	}
-	if err := zipFile.Close(); err != nil {
+	if err := mergeZips(b.backupFileName, parts); err != nil {
 		return err
 	}
 
@@ -282,6 +236,143 @@ func (b *Backup) ZipFiles() error {
 	}
 
 	return nil
+}
+
+// zipRootPath zips one parent path into partPath. Returns false if the path
+// is not a directory and was skipped.
+func (b *Backup) zipRootPath(nickname string, pathCfg config.ParentPath, partPath string) (bool, error) {
+	rootPath := pathCfg.Path
+
+	info, err := os.Stat(rootPath)
+	if err != nil || !info.IsDir() {
+		cosmetics.CPrint(fmt.Sprintf("\n&c%s is not a directory, ignoring...", rootPath))
+		return false, nil
+	}
+
+	compiled := make([]*regexp.Regexp, 0, len(pathCfg.Ignore))
+	for _, pattern := range pathCfg.Ignore {
+		re, err := regexp.Compile(pattern)
+		if err != nil {
+			cosmetics.CPrint(fmt.Sprintf("&cInvalid ignore regex %q for %s: %v", pattern, nickname, err))
+			continue
+		}
+		compiled = append(compiled, re)
+	}
+
+	zipFile, err := os.Create(partPath)
+	if err != nil {
+		return false, err
+	}
+	defer zipFile.Close()
+
+	zw := zip.NewWriter(zipFile)
+	defer zw.Close()
+
+	textOutput := ""
+	newlineCount := 0
+
+	err = filepath.Walk(rootPath, func(absPath string, fi os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if fi.IsDir() {
+			return nil
+		}
+
+		var relativeFilename string
+		if rootPath == b.mongodbAbsLocation {
+			rel := strings.TrimPrefix(strings.TrimPrefix(absPath, b.mongodbAbsLocation), string(os.PathSeparator))
+			relativeFilename = filepath.Join("mongodb", rel)
+		} else {
+			rel := strings.TrimPrefix(strings.TrimPrefix(absPath, rootPath), string(os.PathSeparator))
+			relativeFilename = filepath.Join(nickname, rel)
+		}
+
+		ignored := false
+		for _, re := range compiled {
+			if re.MatchString(absPath) {
+				ignored = true
+				break
+			}
+		}
+
+		if !ignored {
+			var arcname string
+			if b.saveRelative {
+				arcname = relativeFilename
+			} else {
+				arcname = absPath
+			}
+			if err := addFileToZip(zw, absPath, arcname); err != nil {
+				return err
+			}
+			if b.debug && b.showSuccess {
+				textOutput += fmt.Sprintf("&a%s\n", relativeFilename)
+				newlineCount++
+			}
+		} else {
+			if b.debug && b.showIgnored && !strings.Contains(absPath, "node_modules") {
+				textOutput += fmt.Sprintf("&c%s ignored\n", relativeFilename)
+				newlineCount++
+			}
+		}
+
+		if b.debug && newlineCount > 0 && newlineCount%25 == 0 {
+			cosmetics.CPrint(textOutput)
+			textOutput = ""
+		}
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+	if b.debug && textOutput != "" {
+		cosmetics.CPrint(textOutput)
+	}
+
+	if err := zw.Close(); err != nil {
+		return false, err
+	}
+	return true, zipFile.Close()
+}
+
+// mergeZips copies every entry of parts (already compressed) into dst.
+// Empty strings in parts are skipped.
+func mergeZips(dst string, parts []string) error {
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	zw := zip.NewWriter(out)
+	defer zw.Close()
+
+	for _, part := range parts {
+		if part == "" {
+			continue
+		}
+		if err := func() error {
+			zr, err := zip.OpenReader(part)
+			if err != nil {
+				return err
+			}
+			defer zr.Close()
+			for _, f := range zr.File {
+				if err := zw.Copy(f); err != nil {
+					return err
+				}
+			}
+			return nil
+		}(); err != nil {
+			return err
+		}
+	}
+
+	if err := zw.Close(); err != nil {
+		return err
+	}
+	return out.Close()
 }
 
 func addFileToZip(zw *zip.Writer, srcPath, arcname string) error {
@@ -387,7 +478,9 @@ func (b *Backup) SendFileToSFTPServer() error {
 		}
 		defer conn.Close()
 
-		client, err := sftp.NewClient(conn)
+		// Concurrent writes pipeline the 32KB SFTP packets instead of waiting
+		// on each ack; sequential uploads are capped at ~32KB per round trip.
+		client, err := sftp.NewClient(conn, sftp.UseConcurrentWrites(true), sftp.MaxConcurrentRequestsPerFile(64))
 		if err != nil {
 			return err
 		}
@@ -415,7 +508,10 @@ func (b *Backup) SendFileToSFTPServer() error {
 		}
 		defer dst.Close()
 
-		if _, err := io.Copy(dst, src); err != nil {
+		if _, err := dst.ReadFrom(src); err != nil {
+			return err
+		}
+		if err := dst.Close(); err != nil {
 			return err
 		}
 
